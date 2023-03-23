@@ -48,7 +48,7 @@ import {
   Type,
 } from "./definitions";
 import { ERRORS } from "./error";
-import { isDirectSubtype, sameType } from "./types";
+import { isDirectSubtype, isSubtype, sameType } from "./types";
 import { assert, mapEntries, MapWithCachedArrays, MultiMap, SetMultiMap } from "./utils";
 import { argumentsEquals, argumentsFromAST, isValidValue, valueToAST, valueToString } from "./values";
 import { createHash } from '@apollo/utils.createhash';
@@ -612,6 +612,7 @@ export class Operation {
 
     const usages = new Map<string, number>();
     optimizedSelection.collectUsedFragmentNames(usages);
+    // fragments.
     for (const fragment of fragments.names()) {
       if (!usages.has(fragment)) {
         usages.set(fragment, 0);
@@ -1583,6 +1584,7 @@ export class FieldSelection extends Freezable<FieldSelection> {
   readonly kind = 'FieldSelection' as const;
   readonly selectionSet?: SelectionSet;
 
+
   constructor(
     readonly field: Field<any>,
     initialSelectionSet? : SelectionSet
@@ -1620,7 +1622,7 @@ export class FieldSelection extends Freezable<FieldSelection> {
   }
 
   optimize(fragments: NamedFragments, options: OptimizeOptions = {}): Selection {
-    const optimizedSelection = this.selectionSet ? this.selectionSet.optimize(fragments, options) : undefined;
+    let optimizedSelection = this.selectionSet ? this.selectionSet.optimize(fragments, options) : undefined;
     const fieldBaseType = baseType(this.field.definition.type!);
     if (isCompositeType(fieldBaseType) && optimizedSelection) {
       for (const candidate of fragments.maybeApplyingAtType(fieldBaseType)) {
@@ -1650,12 +1652,32 @@ export class FieldSelection extends Freezable<FieldSelection> {
         //   }
         // To do that, we can change that `equals` to `contains`, but then we should also "extract" the remainder
         // of `optimizedSelection` that isn't covered by the fragment, and that is the part slighly more involved.
-        if (optimizedSelection.equals(candidate.selectionSet)) {
+        if (optimizedSelection && optimizedSelection.equals(candidate.selectionSet)) {
           const fragmentSelection = new FragmentSpreadSelection(fieldBaseType, fragments, candidate.name);
           return new FieldSelection(this.field, selectionSetOf(fieldBaseType, fragmentSelection));
+        } else if(options?.autoFragmetize && optimizedSelection && optimizedSelection.contains(candidate.selectionSet)) {
+          // As mentioned in the above comment, we find any fragments that match some of the members of the optimizedSelection
+          // If yes, repace part of the optimizedSelection with the existing fragment
+          const fragmentedSelection = new FragmentSpreadSelection(fieldBaseType, fragments, candidate.name);
+          // Get the remainder unmatched slections
+          const selectionSetNotFragmented = optimizedSelection.minus(candidate.selectionSet);
+          // Create a selection set that includes partly matched fragment and unmatched selections
+          const modifiedSelection = new SelectionSet(fieldBaseType, fragments);
+          modifiedSelection.add(fragmentedSelection);
+          if(!selectionSetNotFragmented.isEmpty()) {
+            for(const selection of selectionSetNotFragmented.selections()) {
+              modifiedSelection.add(selection);
+            }
+          }
+          // reassign optimizedSelection
+          if(modifiedSelection)
+            optimizedSelection = modifiedSelection;
+          // In the above partial selection, if the input query contains fragments inside a fragment for a selectionset
+          // we will not be able to regenerate exactly the same because the Map is not ordered.
+          // But defeinitely helps in many cases.
         }
       }
-      // Create a new named fragment with exact selection set.
+      // Create a new named fragment with exact selection set, only if we did not find any matching fragment in the input query.
       // Incase we see this same pattern in another part of the query,
       // this will help reduce query expansion when sending requests to subgraphs.
       // If we don't see the same pattern the final pass of optimizer will re-expand it.
@@ -2089,9 +2111,33 @@ class InlineFragmentSelection extends FragmentSelection {
           }
           optimizedSelection = selectionSetOf(spread.element().parentType, spread);
           break;
+        } else if(options?.autoFragmetize && optimizedSelection.contains(candidate.selectionSet)) {
+          // As mentioned in the above comment, we find any fragments that match some of the members of the optimizedSelection
+          // If yes, repace part of the optimizedSelection with the existing fragment
+          // The selected fragment should be a subtype or an exact type match
+          if (isSubtype(typeCondition, candidate.typeCondition)) {
+            const fragmentedSelection = new FragmentSpreadSelection(candidate.typeCondition, fragments, candidate.name);
+            // Get the remainder unmatched slections
+            const selectionSetNotFragmented = optimizedSelection.minus(candidate.selectionSet);
+            // Create a selection set that includes partly matched fragment and unmatched selections
+            const modifiedSelection = new SelectionSet(typeCondition, fragments);
+            modifiedSelection.add(fragmentedSelection);
+            if(!selectionSetNotFragmented.isEmpty()) {
+              for(const selection of selectionSetNotFragmented.selections()) {
+                modifiedSelection.add(selection);
+              }
+            }
+            // reassign optimizedSelection
+            if(modifiedSelection) {
+              optimizedSelection = modifiedSelection;
+            }
+            // In the above partial selection, if the input query contains fragments inside a fragment for a selectionset
+            // we will not be able to regenerate exactly the same because the Map is not ordered.
+            // But defenitely helps in many scenarios.
+          }
         }
       }
-      // Create a new named fragment with exact selection set.
+      // Create a new named fragment with exact selection set, only if we did not find any matching fragment in the input query.
       // Incase we see this same pattern in another part of the query,
       // this will help reduce query expansion when sending requests to subgraphs.
       // If we don't see the same pattern the final pass of optimizer will re-expand it.
@@ -2100,7 +2146,11 @@ class InlineFragmentSelection extends FragmentSelection {
         const hash = createHash('sha256').update(optimizedSelection.toString()).digest('hex');
         const newFragment = new NamedFragmentDefinition(schema, typeCondition + hash, typeCondition, optimizedSelection);
         fragments.addIfNotExist(newFragment);
-        return new FragmentSpreadSelection(this.element().parentType, fragments, newFragment.name);
+        const newSpread = new FragmentSpreadSelection(this.element().parentType, fragments, newFragment.name);
+        this.fragmentElement.appliedDirectives.forEach((directive) => {
+          newSpread.element().applyDirective(directive.definition!, directive.arguments());
+        })
+        return newSpread;
       }
     }
     return this.selectionSet === optimizedSelection
